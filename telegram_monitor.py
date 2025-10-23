@@ -211,10 +211,10 @@ async def main():
         StringSession(), 
         API_ID, 
         API_HASH
-    ).start(bot_token=BOT_TOKEN)
+    )
     
     await client.connect()
-    await bot.start()
+    await bot.start(bot_token=BOT_TOKEN)
     
     if not await client.is_user_authorized():
         print("❌ Session string недействителен!")
