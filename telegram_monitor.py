@@ -147,43 +147,54 @@ async def monitor_channel(client, bot, channel_username, processed_dict):
             # Проверяем, нужно ли пересылать
             if should_forward_message(message_text):
                 success = False
+                
+                # Попытка 1: Пересылка оригинального сообщения через БОТА
                 try:
-                    print(f"🔄 Попытка пересылки {message.id} через client...")
-                    # Пересылаем ОРИГИНАЛЬНОЕ сообщение через client (ваш аккаунт)
-                    result = await client.forward_messages(
+                    print(f"🔄 Попытка пересылки {message.id} через bot...")
+                    result = await bot.forward_messages(
                         entity=YOUR_USER_ID,
                         messages=message.id,
                         from_peer=channel
                     )
                     
                     if result:
-                        print(f"✅ Переслано через client: {channel_username} / {message.id}")
+                        print(f"✅ Переслано через bot: {channel_username} / {message.id}")
                         forwarded += 1
                         success = True
                         await asyncio.sleep(1)
                     
                 except Exception as e:
-                    print(f"⚠️ Client пересылка не удалась: {str(e)[:150]}")
+                    print(f"⚠️ Bot пересылка не удалась: {str(e)[:150]}")
                 
-                # Если пересылка не удалась - отправляем текстом
+                # Попытка 2: Если не удалось - отправляем текстом
                 if not success:
                     try:
-                        print(f"📝 Отправка текстом через bot...")
+                        print(f"📝 Отправка текстом...")
                         channel_name = channel_username.strip('@')
-                        fallback_text = f"📢 Пост из {channel_username}\n\n"
+                        
+                        # Формируем сообщение
+                        fallback_text = f"📢 **Пост из {channel_username}**\n\n"
+                        
+                        # Добавляем ссылку если это публичный канал
                         if not channel_username.startswith('-'):
                             fallback_text += f"🔗 https://t.me/{channel_name}/{message.id}\n\n"
-                        fallback_text += f"📝 {message_text[:1000]}"
-                        if len(message_text) > 1000:
-                            fallback_text += "..."
+                        
+                        # Добавляем текст
+                        if message_text:
+                            fallback_text += f"{message_text[:3000]}"
+                            if len(message_text) > 3000:
+                                fallback_text += "\n\n... (сообщение обрезано)"
+                        else:
+                            fallback_text += "(Сообщение без текста - возможно только медиа)"
                         
                         await bot.send_message(YOUR_USER_ID, fallback_text)
-                        print(f"✅ Отправлено текстом через bot: {channel_username} / {message.id}")
+                        print(f"✅ Отправлено текстом: {channel_username} / {message.id}")
                         forwarded += 1
                         await asyncio.sleep(1)
+                        
                     except Exception as bot_error:
-                        print(f"❌ Bot отправка тоже не удалась: {bot_error}")
-                        # Не увеличиваем forwarded - реально не отправилось
+                        print(f"❌ Текстовая отправка не удалась: {bot_error}")
+                        # Не увеличиваем forwarded
         
         return new_processed, forwarded, skipped_duplicates
         
