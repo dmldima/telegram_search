@@ -149,8 +149,8 @@ async def monitor_channel(client, bot, channel_username, processed_dict):
                 success = False
                 
                 # Попытка 1: Пересылка оригинального сообщения через БОТА
+                # (работает только для публичных каналов)
                 try:
-                    print(f"🔄 Попытка пересылки {message.id} через bot...")
                     result = await bot.forward_messages(
                         entity=YOUR_USER_ID,
                         messages=message.id,
@@ -158,18 +158,18 @@ async def monitor_channel(client, bot, channel_username, processed_dict):
                     )
                     
                     if result:
-                        print(f"✅ Переслано через bot: {channel_username} / {message.id}")
+                        print(f"✅ Переслано: {channel_username} / {message.id}")
                         forwarded += 1
                         success = True
                         await asyncio.sleep(1)
                     
                 except Exception as e:
-                    print(f"⚠️ Bot пересылка не удалась: {str(e)[:150]}")
+                    # Пересылка не удалась - это нормально для групп/приватных каналов
+                    pass
                 
-                # Попытка 2: Если не удалось - отправляем текстом
+                # Попытка 2: Отправка текстом (основной способ)
                 if not success:
                     try:
-                        print(f"📝 Отправка текстом...")
                         channel_name = channel_username.strip('@')
                         
                         # Формируем сообщение
@@ -188,12 +188,12 @@ async def monitor_channel(client, bot, channel_username, processed_dict):
                             fallback_text += "(Сообщение без текста - возможно только медиа)"
                         
                         await bot.send_message(YOUR_USER_ID, fallback_text)
-                        print(f"✅ Отправлено текстом: {channel_username} / {message.id}")
+                        print(f"✅ Отправлено: {channel_username} / {message.id}")
                         forwarded += 1
                         await asyncio.sleep(1)
                         
                     except Exception as bot_error:
-                        print(f"❌ Текстовая отправка не удалась: {bot_error}")
+                        print(f"❌ Не удалось отправить {message.id}: {bot_error}")
                         # Не увеличиваем forwarded
         
         return new_processed, forwarded, skipped_duplicates
@@ -287,18 +287,8 @@ async def main():
         print(f"⏭️ Пропущено дублей: {total_skipped}")
         print(f"🧹 Удалено старых записей: {removed_count}")
         
-        # Отправляем отчет
-        report = f"✅ Мониторинг завершен\n\n"
-        report += f"📺 Проверено каналов: {len(CHANNELS)}\n"
-        report += f"📝 Обработано новых: {total_new}\n"
-        report += f"📤 Переслано: {total_forwarded}\n"
-        report += f"⏭️ Пропущено дублей: {total_skipped}\n"
-        report += f"💾 Всего в базе: {len(processed_dict)}\n"
-        if removed_count > 0:
-            report += f"🧹 Очищено старых: {removed_count}\n"
-        report += f"⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        
-        await bot.send_message(YOUR_USER_ID, report)
+        # Не отправляем никаких служебных сообщений
+        # Пользователь получает только сами посты
         
     except Exception as e:
         print(f"❌ Критическая ошибка: {e}")
