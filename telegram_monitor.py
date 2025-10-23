@@ -146,34 +146,44 @@ async def monitor_channel(client, bot, channel_username, processed_dict):
             
             # Проверяем, нужно ли пересылать
             if should_forward_message(message_text):
+                success = False
                 try:
-                    # Пересылаем ОРИГИНАЛЬНОЕ сообщение
-                    await client.forward_messages(
+                    print(f"🔄 Попытка пересылки {message.id} через client...")
+                    # Пересылаем ОРИГИНАЛЬНОЕ сообщение через client (ваш аккаунт)
+                    result = await client.forward_messages(
                         entity=YOUR_USER_ID,
                         messages=message.id,
                         from_peer=channel
                     )
-                    forwarded += 1
                     
-                    print(f"✅ Переслано: {channel_username} / {message.id}")
-                    
-                    # Задержка между отправками
-                    await asyncio.sleep(1)
+                    if result:
+                        print(f"✅ Переслано через client: {channel_username} / {message.id}")
+                        forwarded += 1
+                        success = True
+                        await asyncio.sleep(1)
                     
                 except Exception as e:
-                    print(f"⚠️ Не удалось переслать {message.id}, отправлю текстом: {e}")
-                    # Отправляем текстом если пересылка не удалась
-                    channel_name = channel_username.strip('@')
-                    fallback_text = f"📢 Пост из {channel_username}\n\n"
-                    if not channel_username.startswith('-'):
-                        fallback_text += f"🔗 https://t.me/{channel_name}/{message.id}\n\n"
-                    fallback_text += f"📝 {message_text[:1000]}"
-                    if len(message_text) > 1000:
-                        fallback_text += "..."
-                    
-                    await bot.send_message(YOUR_USER_ID, fallback_text)
-                    forwarded += 1
-                    await asyncio.sleep(1)
+                    print(f"⚠️ Client пересылка не удалась: {str(e)[:150]}")
+                
+                # Если пересылка не удалась - отправляем текстом
+                if not success:
+                    try:
+                        print(f"📝 Отправка текстом через bot...")
+                        channel_name = channel_username.strip('@')
+                        fallback_text = f"📢 Пост из {channel_username}\n\n"
+                        if not channel_username.startswith('-'):
+                            fallback_text += f"🔗 https://t.me/{channel_name}/{message.id}\n\n"
+                        fallback_text += f"📝 {message_text[:1000]}"
+                        if len(message_text) > 1000:
+                            fallback_text += "..."
+                        
+                        await bot.send_message(YOUR_USER_ID, fallback_text)
+                        print(f"✅ Отправлено текстом через bot: {channel_username} / {message.id}")
+                        forwarded += 1
+                        await asyncio.sleep(1)
+                    except Exception as bot_error:
+                        print(f"❌ Bot отправка тоже не удалась: {bot_error}")
+                        # Не увеличиваем forwarded - реально не отправилось
         
         return new_processed, forwarded, skipped_duplicates
         
