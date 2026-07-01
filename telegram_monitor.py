@@ -151,6 +151,21 @@ def save_processed_messages(processed_dict):
     return len(processed_dict) - len(cleaned)  # Количество удаленных
 
 
+def matches_word_start(term, text_lower):
+    """
+    True, если term встречается в НАЧАЛЕ слова (стемминг с учётом окончаний).
+    Граница слова \\b исключает совпадения в середине слова:
+    'акт' совпадёт с 'акты'/'актуальный', но НЕ с 'контакты'.
+    """
+    if not term:
+        return False
+    try:
+        return re.search(r'\b' + re.escape(term), text_lower) is not None
+    except re.error:
+        # Подстраховка — деградируем до поиска по подстроке
+        return term in text_lower
+
+
 def should_forward_message(message_text, keywords, exclude_keywords, patterns):
     """
     Определяет, нужно ли пересылать сообщение
@@ -158,21 +173,21 @@ def should_forward_message(message_text, keywords, exclude_keywords, patterns):
     """
     if not message_text:
         return False
-    
+
     text_lower = message_text.lower()
-    
-    # Проверка исключающих слов (с поддержкой окончаний)
+
+    # Проверка исключающих слов по началу слова (чтобы, например, исключение
+    # "акт" не отсекало "контакты", но продолжало ловить "акты"/"актуальный").
     for exclude_word in exclude_keywords:
-        if exclude_word:
-            # Ищем слово как часть других слов (окончания)
-            if exclude_word in text_lower:
-                return False
-    
-    # Проверка ключевых слов (с поддержкой окончаний)
+        if matches_word_start(exclude_word, text_lower):
+            return False
+
+    # Проверка ключевых слов (с поддержкой окончаний).
+    # Ключевые слова ищутся по подстроке намеренно: так поведение совпадений
+    # не меняется относительно прежней версии (риск пропустить пост = 0).
+    # Например "инвест" найдет: инвестиции, инвестиция, инвестирование, инвестор
     for keyword in keywords:
         if keyword:
-            # Ищем основу слова - она может быть частью слова с окончанием
-            # Например "инвест" найдет: инвестиции, инвестиция, инвестирование, инвестор
             if keyword in text_lower:
                 return True
     
