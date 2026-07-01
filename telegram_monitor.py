@@ -1,6 +1,6 @@
 import os
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import FloodWaitError
@@ -8,12 +8,15 @@ import asyncio
 import json
 import sys
 
-# Конфигурация из переменных окружения
-API_ID = int(os.getenv('TELEGRAM_API_ID'))
-API_HASH = os.getenv('TELEGRAM_API_HASH')
-SESSION_STRING = os.getenv('SESSION_STRING')
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-YOUR_USER_ID = int(os.getenv('YOUR_USER_ID'))
+# Конфигурация из переменных окружения.
+# Числовые значения парсятся в main() ПОСЛЕ проверки наличия переменных,
+# иначе отсутствие переменной даёт TypeError на импорте (int(None)) вместо
+# понятного сообщения об ошибке.
+API_ID = None
+API_HASH = None
+SESSION_STRING = None
+BOT_TOKEN = None
+YOUR_USER_ID = None
 
 # НОВОЕ: Конфигурация нескольких наборов мониторинга
 # Формат JSON: [{"name": "set1", "channels": ["@chan1"], "keywords": ["word1"], "exclude": ["bad1"], "patterns": ["regex1"]}, ...]
@@ -118,7 +121,8 @@ def load_processed_messages():
             # Конвертируем список в словарь с timestamp для очистки старых записей
             if isinstance(data, list):
                 # Старый формат - конвертируем
-                return {msg_id: datetime.now().isoformat() for msg_id in data}
+                now_iso = datetime.now(timezone.utc).isoformat()
+                return {msg_id: now_iso for msg_id in data}
             return data
     return {}
 
@@ -126,17 +130,40 @@ def load_processed_messages():
 def save_processed_messages(processed_dict):
     """Сохраняет список обработанных сообщений с очисткой старых"""
     # Удаляем записи старше 30 дней
-    cutoff_date = datetime.now() - timedelta(days=30)
-    cleaned = {
-        msg_id: timestamp 
-        for msg_id, timestamp in processed_dict.items()
-        if datetime.fromisoformat(timestamp) > cutoff_date
-    }
-    
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=30)
+    cleaned = {}
+    for msg_id, timestamp in processed_dict.items():
+        try:
+            dt = datetime.fromisoformat(timestamp)
+            # Легаси-записи хранились без таймзоны — считаем их UTC,
+            # иначе сравнение naive и aware дат бросит TypeError.
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+        except (ValueError, TypeError):
+            # Некорректный timestamp — не теряем запись, считаем свежей
+            dt = datetime.now(timezone.utc)
+        if dt > cutoff_date:
+            cleaned[msg_id] = timestamp
+
     with open(PROCESSED_FILE, 'w', encoding='utf-8') as f:
         json.dump(cleaned, f, ensure_ascii=False, indent=2)
-    
+
     return len(processed_dict) - len(cleaned)  # Количество удаленных
+
+
+def matches_word_start(term, text_lower):
+    """
+    True, если term встречается в НАЧАЛЕ слова (стемминг с учётом окончаний).
+    Граница слова \\b исключает совпадения в середине слова:
+    'акт' совпадёт с 'акты'/'актуальный', но НЕ с 'контакты'.
+    """
+    if not term:
+        return False
+    try:
+        return re.search(r'\b' + re.escape(term), text_lower) is not None
+    except re.error:
+        # Подстраховка — деградируем до поиска по подстроке
+        return term in text_lower
 
 
 def should_forward_message(message_text, keywords, exclude_keywords, patterns):
@@ -146,21 +173,21 @@ def should_forward_message(message_text, keywords, exclude_keywords, patterns):
     """
     if not message_text:
         return False
-    
+
     text_lower = message_text.lower()
-    
-    # Проверка исключающих слов (с поддержкой окончаний)
+
+    # Проверка исключающих слов по началу слова (чтобы, например, исключение
+    # "акт" не отсекало "контакты", но продолжало ловить "акты"/"актуальный").
     for exclude_word in exclude_keywords:
-        if exclude_word:
-            # Ищем слово как часть других слов (окончания)
-            if exclude_word in text_lower:
-                return False
-    
-    # Проверка ключевых слов (с поддержкой окончаний)
+        if matches_word_start(exclude_word, text_lower):
+            return False
+
+    # Проверка ключевых слов (с поддержкой окончаний).
+    # Ключевые слова ищутся по подстроке намеренно: так поведение совпадений
+    # не меняется относительно прежней версии (риск пропустить пост = 0).
+    # Например "инвест" найдет: инвестиции, инвестиция, инвестирование, инвестор
     for keyword in keywords:
         if keyword:
-            # Ищем основу слова - она может быть частью слова с окончанием
-            # Например "инвест" найдет: инвестиции, инвестиция, инвестирование, инвестор
             if keyword in text_lower:
                 return True
     
@@ -176,119 +203,114 @@ def should_forward_message(message_text, keywords, exclude_keywords, patterns):
     return False
 
 
-async def monitor_channel(client, bot, channel_username, keywords, exclude_keywords, patterns, processed_dict, set_name):
+async def send_match(bot, channel_username, message, message_text, set_name):
+    """
+    Отправляет совпавшее сообщение пользователю текстом.
+    Возвращает True при успешной отправке, иначе False.
+
+    Пересылка через bot.forward_messages убрана намеренно: бот не имеет доступа
+    к entity канала, разрешённому пользовательским клиентом, поэтому она почти
+    всегда падала и приводила к лишнему API-вызову на каждое совпадение.
+    parse_mode не используется — текст канала произвольный и мог бы ломать
+    markdown-разметку, поэтому отправляем как обычный текст.
+    """
+    retry_count = 0
+    max_retries = 3
+
+    while retry_count < max_retries:
+        try:
+            channel_name = channel_username.strip('@')
+
+            text = f"📢 [{set_name}] Пост из {channel_username}\n\n"
+
+            # Ссылка только для публичных каналов (не числовой -100... id)
+            if not channel_username.startswith('-'):
+                text += f"🔗 https://t.me/{channel_name}/{message.id}\n\n"
+
+            if message_text:
+                text += message_text[:3000]
+                if len(message_text) > 3000:
+                    text += "\n\n... (сообщение обрезано)"
+            else:
+                text += "(Сообщение без текста — возможно, только медиа)"
+
+            await bot.send_message(YOUR_USER_ID, text)
+            print(f"✅ [{set_name}] Отправлено: {channel_username} / {message.id}")
+            await asyncio.sleep(1)
+            return True
+
+        except FloodWaitError as flood_error:
+            wait_time = flood_error.seconds
+            print(f"⏳ [{set_name}] FloodWait: ждём {wait_time} секунд...")
+            await asyncio.sleep(wait_time)
+            retry_count += 1
+
+        except Exception as bot_error:
+            print(f"❌ [{set_name}] Не удалось отправить {message.id}: {bot_error}")
+            return False
+
+    print(f"❌ [{set_name}] Исчерпаны попытки отправки {message.id}")
+    return False
+
+
+async def monitor_channel(client, bot, channel_username, keywords, exclude_keywords, patterns, processed_dict, set_name, errors):
     """
     Мониторит один канал и возвращает статистику
     """
     new_processed = 0
     forwarded = 0
     skipped_duplicates = 0
-    
+
     try:
         # Получаем канал
         channel = await client.get_entity(channel_username)
-        
+
         print(f"📡 [{set_name}] Проверяю канал: {channel_username}")
-        
-        # Получаем сообщения за заданный период
-        time_threshold = datetime.now() - timedelta(hours=TIME_RANGE_HOURS)
-        
+
+        # Получаем сообщения за заданный период (message.date — aware UTC)
+        time_threshold = datetime.now(timezone.utc) - timedelta(hours=TIME_RANGE_HOURS)
+
         # Получаем сообщения с учетом глубины поиска
         async for message in client.iter_messages(channel, limit=SEARCH_DEPTH):
             # Пропускаем старые сообщения
-            if message.date.replace(tzinfo=None) < time_threshold:
+            if message.date < time_threshold:
                 break
-            
+
             # Создаем уникальный ID для сообщения (канал + ID сообщения)
             unique_id = f"{channel_username}:{message.id}"
-            
+
             # Пропускаем уже обработанные (проверка на дубли)
             if unique_id in processed_dict:
                 skipped_duplicates += 1
                 continue
-            
+
             # Проверяем текст сообщения
             message_text = message.text or ""
-            
-            # Добавляем в обработанные с timestamp
-            processed_dict[unique_id] = datetime.now().isoformat()
-            new_processed += 1
-            
+
             # Проверяем, нужно ли пересылать
             if should_forward_message(message_text, keywords, exclude_keywords, patterns):
-                success = False
-                
-                # Попытка 1: Пересылка оригинального сообщения через БОТА
-                # (работает только для публичных каналов)
-                try:
-                    result = await bot.forward_messages(
-                        entity=YOUR_USER_ID,
-                        messages=message.id,
-                        from_peer=channel
-                    )
-                    
-                    if result:
-                        print(f"✅ [{set_name}] Переслано: {channel_username} / {message.id}")
-                        forwarded += 1
-                        success = True
-                        await asyncio.sleep(1)
-                    
-                except Exception as e:
-                    # Пересылка не удалась - это нормально для групп/приватных каналов
-                    pass
-                
-                # Попытка 2: Отправка текстом (основной способ)
-                if not success:
-                    retry_count = 0
-                    max_retries = 3
-                    
-                    while retry_count < max_retries:
-                        try:
-                            channel_name = channel_username.strip('@')
-                            
-                            # Формируем сообщение с указанием набора
-                            fallback_text = f"📢 **[{set_name}] Пост из {channel_username}**\n\n"
-                            
-                            # Добавляем ссылку если это публичный канал
-                            if not channel_username.startswith('-'):
-                                fallback_text += f"🔗 https://t.me/{channel_name}/{message.id}\n\n"
-                            
-                            # Добавляем текст
-                            if message_text:
-                                fallback_text += f"{message_text[:3000]}"
-                                if len(message_text) > 3000:
-                                    fallback_text += "\n\n... (сообщение обрезано)"
-                            else:
-                                fallback_text += "(Сообщение без текста - возможно только медиа)"
-                            
-                            await bot.send_message(YOUR_USER_ID, fallback_text)
-                            print(f"✅ [{set_name}] Отправлено: {channel_username} / {message.id}")
-                            forwarded += 1
-                            await asyncio.sleep(1)
-                            break  # Успешно отправлено
-                            
-                        except FloodWaitError as flood_error:
-                            wait_time = flood_error.seconds
-                            print(f"⏳ [{set_name}] FloodWait: ждём {wait_time} секунд...")
-                            await asyncio.sleep(wait_time)
-                            retry_count += 1
-                            
-                        except Exception as bot_error:
-                            print(f"❌ [{set_name}] Не удалось отправить {message.id}: {bot_error}")
-                            break
-        
+                # Помечаем обработанным ТОЛЬКО после успешной отправки, иначе
+                # временный сбой отправки приведёт к безвозвратной потере
+                # совпавшего сообщения. При неудаче — ретрай на следующем прогоне.
+                if await send_match(bot, channel_username, message, message_text, set_name):
+                    processed_dict[unique_id] = datetime.now(timezone.utc).isoformat()
+                    new_processed += 1
+                    forwarded += 1
+            else:
+                # Несовпавшие помечаем сразу, чтобы не проверять их повторно
+                processed_dict[unique_id] = datetime.now(timezone.utc).isoformat()
+                new_processed += 1
+
         return new_processed, forwarded, skipped_duplicates
-        
+
     except Exception as e:
+        # Не шлём уведомление на каждый канал (спам) — накапливаем и шлём сводку
         print(f"❌ [{set_name}] Ошибка в канале {channel_username}: {e}")
-        await bot.send_message(
-            YOUR_USER_ID, 
-            f"⚠️ [{set_name}] Ошибка при обработке {channel_username}:\n{e}"
-        )
+        errors.append(f"[{set_name}] {channel_username}: {e}")
         return 0, 0, 0
 
 
-async def process_monitor_set(client, bot, monitor_set, processed_dict):
+async def process_monitor_set(client, bot, monitor_set, processed_dict, errors):
     """
     Обрабатывает один набор мониторинга
     """
@@ -327,7 +349,8 @@ async def process_monitor_set(client, bot, monitor_set, processed_dict):
             exclude_keywords,
             patterns,
             processed_dict,
-            set_name
+            set_name,
+            errors
         )
         total_new += new
         total_forwarded += forwarded
@@ -353,7 +376,20 @@ async def main():
     if missing:
         print(f"❌ Отсутствуют обязательные переменные: {', '.join(missing)}")
         return
-    
+
+    # Парсим числовые переменные здесь (а не на импорте), чтобы некорректное
+    # значение давало понятное сообщение, а не TypeError/ValueError в трейсбеке.
+    global API_ID, API_HASH, SESSION_STRING, BOT_TOKEN, YOUR_USER_ID
+    try:
+        API_ID = int(os.getenv('TELEGRAM_API_ID'))
+        YOUR_USER_ID = int(os.getenv('YOUR_USER_ID'))
+    except (TypeError, ValueError):
+        print("❌ TELEGRAM_API_ID и YOUR_USER_ID должны быть целыми числами")
+        return
+    API_HASH = os.getenv('TELEGRAM_API_HASH')
+    SESSION_STRING = os.getenv('SESSION_STRING')
+    BOT_TOKEN = os.getenv('BOT_TOKEN')
+
     # Проверка на параллельный запуск (только для Unix-систем)
     lock_file = None
     if sys.platform != 'win32':
@@ -402,7 +438,7 @@ async def main():
             )
             return
         
-        print(f"🚀 Бот запущен: {datetime.now()}")
+        print(f"🚀 Бот запущен: {datetime.now(timezone.utc).isoformat()}")
         print(f"📦 Всего наборов мониторинга: {len(monitor_sets)}")
         print(f"📊 Глубина поиска: {SEARCH_DEPTH} сообщений")
         print(f"⏱️ Временной диапазон: {TIME_RANGE_HOURS} часов")
@@ -415,7 +451,8 @@ async def main():
         total_new = 0
         total_forwarded = 0
         total_skipped = 0
-        
+        errors = []
+
         try:
             # Обрабатываем каждый набор последовательно
             for monitor_set in monitor_sets:
@@ -423,28 +460,42 @@ async def main():
                     client,
                     bot,
                     monitor_set,
-                    processed_dict
+                    processed_dict,
+                    errors
                 )
                 total_new += new
                 total_forwarded += forwarded
                 total_skipped += skipped
-            
-            # Сохраняем обработанные ID и очищаем старые
-            removed_count = save_processed_messages(processed_dict)
-            
+
             print(f"\n{'='*60}")
             print(f"✨ ИТОГО по всем наборам:")
             print(f"   Обработано новых: {total_new}")
             print(f"   Переслано: {total_forwarded}")
             print(f"   Пропущено дублей: {total_skipped}")
-            print(f"   Удалено старых записей: {removed_count}")
             print(f"{'='*60}")
-            
+
+            # Единая сводка об ошибках каналов вместо уведомления на каждый канал
+            if errors:
+                summary = "⚠️ Ошибки при обработке каналов:\n\n" + "\n".join(
+                    f"• {e}" for e in errors
+                )
+                try:
+                    await bot.send_message(YOUR_USER_ID, summary[:4000])
+                except Exception as notify_err:
+                    print(f"❌ Не удалось отправить сводку ошибок: {notify_err}")
+
         except Exception as e:
             print(f"❌ Критическая ошибка: {e}")
-            await bot.send_message(YOUR_USER_ID, f"⚠️ Критическая ошибка:\n{e}")
-        
+            try:
+                await bot.send_message(YOUR_USER_ID, f"⚠️ Критическая ошибка:\n{e}")
+            except Exception:
+                pass
+
         finally:
+            # Сохраняем состояние В ЛЮБОМ случае, иначе при ошибке в середине
+            # прогона отметки «обработано» теряются и дубли шлются повторно.
+            removed_count = save_processed_messages(processed_dict)
+            print(f"🧹 Удалено старых записей: {removed_count}")
             await client.disconnect()
             await bot.disconnect()
     
@@ -457,7 +508,7 @@ async def main():
                 lock_file.close()
                 os.remove(LOCK_FILE)
                 print("🔓 Блокировка снята")
-            except:
+            except Exception:
                 pass
 
 

@@ -8,9 +8,16 @@ on:
   # Возможность запустить вручную
   workflow_dispatch:
 
-# Добавляем права на запись
+# Состояние теперь хранится в кэше Actions, а не коммитится в репозиторий,
+# поэтому запись в contents больше не нужна — достаточно чтения для checkout.
 permissions:
-  contents: write
+  contents: read
+
+# Не допускаем параллельных прогонов (расписание + ручной запуск),
+# иначе гонка на общем кэше состояния (последний перезапишет предыдущего).
+concurrency:
+  group: telegram-monitor
+  cancel-in-progress: false
 
 jobs:
   monitor:
@@ -18,21 +25,32 @@ jobs:
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
-      with:
-        token: ${{ secrets.GITHUB_TOKEN }}
-    
+      uses: actions/checkout@v4
+
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-    
+
     - name: Cache dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-    
+
+    # Состояние обработанных сообщений: восстанавливаем самый свежий кэш по
+    # префиксу и сохраняем новый после прогона. Ключ уникален на каждый запуск
+    # (run_id), поэтому post-step всегда сохраняет обновлённый файл.
+    # На самом первом прогоне кэша ещё нет — берётся закоммиченный
+    # processed_messages.json из репозитория как стартовое состояние (seed).
+    - name: Restore/save processed messages state
+      uses: actions/cache@v4
+      with:
+        path: processed_messages.json
+        key: processed-messages-${{ github.run_id }}
+        restore-keys: |
+          processed-messages-
+
     - name: Install dependencies
       run: |
         pip install -r requirements.txt
@@ -54,11 +72,6 @@ jobs:
         TIME_RANGE_HOURS: ${{ vars.TIME_RANGE_HOURS || '24' }}
       run: |
         python telegram_monitor.py
-    
-    - name: Commit processed messages
-      run: |
-        git config --local user.email "github-actions[bot]@users.noreply.github.com"
-        git config --local user.name "github-actions[bot]"
-        git add processed_messages.json
-        git diff --quiet && git diff --staged --quiet || git commit -m "Update processed messages [skip ci]"
-        git push
+    # Коммит состояния в репозиторий больше не нужен: processed_messages.json
+    # сохраняется в кэше Actions post-step'ом шага «Restore/save processed
+    # messages state». Это убирает ежедневные мусорные коммиты и рост истории git.
