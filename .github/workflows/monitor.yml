@@ -12,23 +12,29 @@ on:
 permissions:
   contents: write
 
+# Не допускаем параллельных прогонов (расписание + ручной запуск),
+# иначе гонка git push и потеря/конфликт состояния.
+concurrency:
+  group: telegram-monitor
+  cancel-in-progress: false
+
 jobs:
   monitor:
     runs-on: ubuntu-latest
     
     steps:
     - name: Checkout repository
-      uses: actions/checkout@v3
+      uses: actions/checkout@v4
       with:
         token: ${{ secrets.GITHUB_TOKEN }}
-    
+
     - name: Set up Python
-      uses: actions/setup-python@v4
+      uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-    
+
     - name: Cache dependencies
-      uses: actions/cache@v3
+      uses: actions/cache@v4
       with:
         path: ~/.cache/pip
         key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
@@ -60,5 +66,20 @@ jobs:
         git config --local user.email "github-actions[bot]@users.noreply.github.com"
         git config --local user.name "github-actions[bot]"
         git add processed_messages.json
-        git diff --quiet && git diff --staged --quiet || git commit -m "Update processed messages [skip ci]"
-        git push
+        if git diff --staged --quiet; then
+          echo "Нет изменений — коммит не требуется"
+          exit 0
+        fi
+        git commit -m "Update processed messages [skip ci]"
+        # Push с ретраями и rebase на случай, если remote ушёл вперёд
+        for attempt in 1 2 3 4; do
+          if git push; then
+            echo "Push успешен (попытка $attempt)"
+            exit 0
+          fi
+          echo "Push не удался (попытка $attempt), пробую rebase..."
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}" || true
+          sleep $((2 ** attempt))
+        done
+        echo "❌ Push не удался после нескольких попыток"
+        exit 1
